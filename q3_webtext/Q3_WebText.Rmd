@@ -1,0 +1,196 @@
+---
+title: "Question 3 - WebText API Proof of Concept"
+author: "R.P Molefe (EDUV4838900)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 6)
+library(rvest); library(robotstxt); library(tidyverse); library(tidytext)
+library(textrank); library(lexRankr); library(wordcloud); library(RColorBrewer)
+library(igraph); library(ggraph); library(textstem)
+set.seed(1234)
+```
+
+# Question 3.1 - Fair-use web scraping into an R data structure
+
+**Website chosen:** Wikipedia article *"Big data"*. Wikipedia text is published under the
+Creative Commons BY-SA licence. The page's `robots.txt` permission is verified before scraping,
+a delay is applied after the request and only one page is requested, in line with fair use of web scraping.
+
+```{r scrape}
+# Q3.1
+url <- "https://en.wikipedia.org/wiki/Big_data"
+allowed <- paths_allowed(url)
+cat("Scraping allowed by robots.txt:", allowed, "\n")
+stopifnot(allowed)
+
+page <- read_html(url); Sys.sleep(2)
+xml2::xml_remove(html_elements(page, "style, script, sup.reference, .mw-editsection"))
+paras <- page |> html_elements("#mw-content-text .mw-parser-output > p") |> html_text2()
+if (length(paras) < 5) paras <- page |> html_elements("#mw-content-text p") |> html_text2()
+if (length(paras) < 5) paras <- page |> html_elements("p") |> html_text2()
+cat("Paragraphs scraped:", length(paras), "\n")
+stopifnot(length(paras) >= 5)
+
+web_df <- tibble(para_id = seq_along(paras), text = paras) |>
+  filter(str_trim(text) != "")
+str(web_df)
+head(web_df |> mutate(text = substr(text, 1, 150)), 5)
+```
+
+# Question 3.2 - Text preprocessing
+
+The following preprocessing techniques were applied: removal of citation markers such as `[12]` and
+`[citation needed]`, removal of bracketed asides, transliteration and removal of non-ASCII characters,
+whitespace normalisation, removal of very short paragraphs, sentence segmentation, word tokenisation,
+stop-word and number removal, removal of short tokens and lemmatisation.
+
+```{r preprocess}
+# Q3.2
+web_df <- web_df |>
+  mutate(text = text |>
+           str_remove_all("\\[(\\d+|citation needed|[a-z]|note \\d+)\\]") |>
+           str_remove_all("\\.?mw-parser-output[^}]*\\}") |>
+           str_replace_all("\\([^)]*\\)", " ") |>
+           stringi::stri_trans_general("Latin-ASCII") |>
+           str_replace_all("[^ -~]", " ") |>
+           str_squish()) |>
+  filter(nchar(text) > 40)
+
+sentences <- web_df |>
+  mutate(sentence = tokenizers::tokenize_sentences(text)) |>
+  select(para_id, sentence) |>
+  tidyr::unnest(sentence) |>
+  mutate(sentence = str_squish(sentence)) |>
+  filter(nchar(sentence) > 30) |>
+  mutate(textrank_id = row_number())
+
+words <- sentences |>
+  tidytext::unnest_tokens(output = word, input = sentence) |>
+  anti_join(stop_words, by = "word") |>
+  filter(!str_detect(word, "\\d"), nchar(word) > 2) |>
+  mutate(word = if_else(word == "data", word, lemmatize_words(word)))
+
+cat("Paragraphs:", nrow(web_df), "| Sentences:", nrow(sentences), "| Clean tokens:", nrow(words), "\n")
+stopifnot(nrow(sentences) > 5)
+head(sentences, 5)
+```
+
+# Question 3.3 - Text summarisation
+
+## Technique 1 - TextRank (graph-based extractive summary)
+
+Each sentence is a node in a graph, edges are weighted by the words two sentences share, and the
+PageRank algorithm selects the most central sentences.
+
+```{r textrank}
+# Q3.3
+tr <- textrank_sentences(data = sentences |> select(textrank_id, sentence),
+                         terminology = words |> select(textrank_id, word))
+textrank_summary <- summary(tr, n = 5, keep.sentence.order = TRUE)
+cat(paste0("- ", textrank_summary), sep = "\n")
+```
+
+## Technique 2 - Frequency-based (Luhn) summary
+
+Each sentence is scored by the average normalised frequency of its important words.
+
+```{r luhn}
+# Q3.3
+freq <- words |> count(word, sort = TRUE) |> mutate(w = n / max(n))
+luhn <- words |> inner_join(freq, by = "word") |>
+  group_by(textrank_id) |> summarise(score = sum(w) / n(), .groups = "drop") |>
+  inner_join(sentences, by = "textrank_id")
+luhn_summary <- luhn |> slice_max(score, n = 5) |> arrange(textrank_id)
+cat(paste0("- ", luhn_summary$sentence), sep = "\n")
+```
+
+## Technique 3 - LexRank (cosine-similarity graph)
+
+```{r lexrank}
+# Q3.3
+lex <- lexRank(sentences$sentence, n = 5, continuous = TRUE, Verbose = FALSE)
+cat(paste0("- ", lex$sentence), sep = "\n")
+```
+
+## Visualisation 1 - Most frequent terms
+
+```{r vis1}
+# Q3.3
+freq |> slice_max(n, n = 15) |>
+  ggplot(aes(reorder(word, n), n)) + geom_col(fill = "darkcyan") + coord_flip() +
+  labs(title = "Top 15 Terms in the Wikipedia 'Big data' Article",
+       x = "Term (lemmatised)", y = "Frequency")
+```
+
+## Visualisation 2 - Word cloud
+
+```{r vis2, fig.height=7}
+# Q3.3
+wordcloud(freq$word, freq$n, max.words = 80, random.order = FALSE, colors = brewer.pal(8, "Dark2"))
+title("Word Cloud of the 'Big data' Article")
+```
+
+## Visualisation 3 - Sentence importance (TextRank) across the article
+
+```{r vis3}
+# Q3.3
+tr$sentences |>
+  ggplot(aes(textrank_id, textrank)) + geom_line(colour = "grey40") + geom_point(colour = "red") +
+  labs(title = "TextRank Score of Each Sentence", x = "Sentence number (order in article)",
+       y = "TextRank importance score")
+```
+
+## Visualisation 4 - Bigram network
+
+```{r vis4, fig.height=8}
+# Q3.3
+bigrams <- tibble(bigram = unlist(tokenizers::tokenize_ngrams(web_df$text, n = 2))) |>
+  filter(!is.na(bigram)) |>
+  separate(bigram, c("w1", "w2"), sep = " ") |>
+  filter(!w1 %in% stop_words$word, !w2 %in% stop_words$word,
+         !str_detect(w1, "\\d"), !str_detect(w2, "\\d")) |>
+  count(w1, w2, sort = TRUE) |> filter(n >= 2)
+
+graph_from_data_frame(head(bigrams, 50)) |>
+  ggraph(layout = "fr") +
+  geom_edge_link(aes(width = n), alpha = 0.4, colour = "steelblue") +
+  geom_node_point(colour = "orange", size = 3) +
+  geom_node_text(aes(label = name), repel = TRUE, size = 3.5) +
+  scale_edge_width(range = c(0.5, 3), name = "Bigram count") +
+  labs(title = "Bigram Network of the 'Big data' Article") + theme_void()
+```
+
+# Findings
+
+```{r findings3, echo=FALSE, results='asis'}
+tr_ids  <- tr$sentences |> filter(sentence %in% textrank_summary) |> pull(textrank_id)
+lex_ids <- sentences$textrank_id[match(lex$sentence, sentences$sentence)]
+ov_tl <- length(intersect(tr_ids, luhn_summary$textrank_id))
+ov_tx <- length(intersect(tr_ids, lex_ids))
+ov_lx <- length(intersect(luhn_summary$textrank_id, lex_ids))
+top_sent <- tr$sentences |> slice_max(textrank, n = 1, with_ties = FALSE)
+top5 <- head(freq, 5)
+bg <- head(bigrams, 5)
+pos <- if (top_sent$textrank_id <= nrow(sentences) / 3) "the opening part" else if (top_sent$textrank_id <= 2 * nrow(sentences) / 3) "the middle" else "the final part"
+
+cat(sprintf("The web page was converted into an R data frame of %d paragraphs, which after preprocessing produced %d sentences and %d clean word tokens for analysis.\n\n",
+            nrow(web_df), nrow(sentences), nrow(words)))
+cat(sprintf("**TextRank** selected five sentences that together describe what big data is, its characteristics and how it is used. The single most central sentence (number %d, located in %s of the article) is: *\"%s\"*\n\n",
+            top_sent$textrank_id, pos, top_sent$sentence))
+cat(sprintf("**Comparison of techniques:** TextRank and the frequency-based (Luhn) summary share %d of their five sentences, TextRank and LexRank share %d, and Luhn and LexRank share %d. ",
+            ov_tl, ov_tx, ov_lx),
+    "The graph-based methods (TextRank and LexRank) favour sentences that are similar to many other sentences and therefore capture the overall theme of the article, while the frequency-based method favours sentences that are dense in the most repeated terms and tends to be more specific.\n\n")
+cat(sprintf("**Term frequency and word cloud:** the dominant terms are *%s*. Their prominence confirms that the article focuses on the nature of data, its analysis and the technologies used to process it.\n\n",
+            paste(sprintf("%s (%d)", top5$word, top5$n), collapse = ", ")))
+cat(sprintf("**Sentence importance:** TextRank scores range from %.4f to %.4f across the article, so a small number of sentences carry most of the article's central meaning.\n\n",
+            min(tr$sentences$textrank), max(tr$sentences$textrank)))
+if (nrow(bg) > 0) {
+  cat(sprintf("**Bigram network:** the most frequent word pairs are *%s*. These pairs form the main clusters in the network and highlight the key concepts the article links together.\n",
+              paste(sprintf("%s %s (%d)", bg$w1, bg$w2, bg$n), collapse = ", ")))
+}
+```

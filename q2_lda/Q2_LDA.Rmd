@@ -1,0 +1,223 @@
+---
+title: "Question 2 - Topic Modelling of News Articles with LDA"
+author: "R.P Molefe (EDUV4838900)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    number_sections: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 6)
+library(tidyverse); library(tidytext); library(tm); library(topicmodels)
+library(textstem); library(wordcloud); library(RColorBrewer); library(slam)
+set.seed(1234)
+```
+
+# Question 2.1 - Data frame (file_name, content) and denoising
+
+```{r load}
+# Q2.1
+unzip("news.zip", exdir = "news", overwrite = TRUE)
+files <- list.files("news", recursive = TRUE, full.names = TRUE)
+files <- files[!grepl("(__MACOSX|/\\.)", files)]
+
+news_df <- tibble(
+  file_name = basename(files),
+  content   = map_chr(files, ~ paste(readLines(.x, warn = FALSE, encoding = "UTF-8"), collapse = " "))
+)
+cat("Documents loaded:", nrow(news_df), "\n")
+head(news_df |> mutate(content = substr(content, 1, 120)))
+```
+
+The following denoising techniques were applied: transliteration of non-ASCII characters, lower-casing,
+removal of URLs, e-mail addresses, HTML tags, numbers and punctuation, whitespace normalisation, removal of
+empty and duplicate documents, stop-word removal (standard and domain-specific news words), removal of
+tokens shorter than three characters, and lemmatisation.
+
+```{r clean}
+# Q2.1
+clean_text <- function(x) {
+  x |>
+    iconv(to = "ASCII//TRANSLIT", sub = " ") |>
+    tolower() |>
+    str_replace_all("http\\S+|www\\.\\S+|\\S+@\\S+", " ") |>
+    str_replace_all("<[^>]+>", " ") |>
+    str_replace_all("[0-9]+", " ") |>
+    str_replace_all("[[:punct:]]", " ") |>
+    str_squish()
+}
+
+news_df <- news_df |>
+  mutate(clean = clean_text(content)) |>
+  filter(nchar(clean) > 50) |>
+  distinct(clean, .keep_all = TRUE)
+
+custom_stop <- tibble(word = c("said","say","mr","mrs","also","will","year","new","one","two",
+                               "can","just","like","get","told","people"))
+tokens <- news_df |>
+  unnest_tokens(word, clean) |>
+  anti_join(stop_words, by = "word") |>
+  anti_join(custom_stop, by = "word") |>
+  filter(nchar(word) > 2) |>
+  mutate(word = lemmatize_words(word))
+
+cat("Documents after cleaning:", n_distinct(tokens$file_name), " | Tokens:", nrow(tokens), "\n")
+tokens |> count(word, sort = TRUE) |> head(15)
+```
+
+# Question 2.2 - LDA: top n topics and top k words
+
+## Number of topics
+
+```{r dtm}
+# Q2.2
+dtm <- tokens |> count(file_name, word) |> cast_dtm(file_name, word, n)
+dtm <- removeSparseTerms(dtm, 0.99)
+dtm <- dtm[row_sums(dtm) > 0, ]
+dtm
+```
+
+```{r tune, fig.height=5}
+# Q2.2
+ks <- 2:8
+perp <- sapply(ks, function(k) perplexity(LDA(dtm, k = k, control = list(seed = 1234))))
+tune <- tibble(topics = ks, perplexity = perp)
+ggplot(tune, aes(topics, perplexity)) +
+  geom_line(colour = "steelblue") + geom_point(size = 3, colour = "steelblue") +
+  scale_x_continuous(breaks = ks) +
+  labs(title = "Figure 2.1 - Perplexity by number of topics",
+       x = "Number of topics (k)", y = "Perplexity (lower is better)") +
+  theme_minimal()
+tune
+```
+
+## LDA model
+
+```{r lda}
+# Q2.2
+n_topics <- 5
+k_words  <- 10
+
+lda <- LDA(dtm, k = n_topics, method = "Gibbs",
+           control = list(seed = 1234, iter = 1000, burnin = 200))
+
+beta  <- tidy(lda, matrix = "beta")
+gamma <- tidy(lda, matrix = "gamma")
+
+top_terms <- beta |> group_by(topic) |> slice_max(beta, n = k_words, with_ties = FALSE) |>
+  arrange(topic, desc(beta)) |> ungroup()
+```
+
+## Top k words per topic
+
+```{r topwords}
+# Q2.2
+top_terms |>
+  group_by(topic) |>
+  mutate(rank = row_number(), word = paste0(term, " (", round(beta, 3), ")")) |>
+  ungroup() |>
+  select(rank, topic, word) |>
+  pivot_wider(names_from = topic, values_from = word, names_prefix = "Topic ") |>
+  knitr::kable(caption = "Top words per topic with beta (word probability) in brackets")
+```
+
+## Word distribution per topic
+
+```{r distribution}
+# Q2.2
+top_terms |> group_by(topic) |>
+  summarise(top_k_probability_mass = round(sum(beta), 3),
+            words = paste(term, collapse = ", ")) |>
+  knitr::kable(caption = "Share of each topic's probability carried by its top words")
+
+gamma |> group_by(topic) |> summarise(avg_document_share = round(mean(gamma), 3)) |>
+  arrange(desc(avg_document_share)) |>
+  knitr::kable(caption = "Topic prevalence across the corpus")
+```
+
+## Findings
+
+```{r findings22, echo=FALSE, results='asis'}
+freq_all <- tokens |> count(word, sort = TRUE)
+prev <- gamma |> group_by(topic) |> summarise(share = mean(gamma), .groups = "drop")
+dom  <- gamma |> group_by(document) |> slice_max(gamma, n = 1, with_ties = FALSE) |>
+  ungroup() |> count(topic, name = "docs")
+tt   <- top_terms |> group_by(topic) |>
+  summarise(w = paste(head(term, 5), collapse = ", "), mass = sum(beta), .groups = "drop") |>
+  left_join(prev, by = "topic") |> left_join(dom, by = "topic") |>
+  mutate(docs = replace_na(docs, 0L))
+best_k <- tune$topics[which.min(tune$perplexity)]
+top_prev <- tt |> slice_max(share, n = 1, with_ties = FALSE)
+
+cat(sprintf("The corpus consists of %d South African news articles. After denoising, %d meaningful tokens remained, ",
+            nrow(news_df), nrow(tokens)),
+    sprintf("and the most frequent terms were *%s*, which reflects the dominant subject matter of the collection.\n\n",
+            paste(sprintf("%s (%d)", head(freq_all$word, 5), head(freq_all$n, 5)), collapse = ", ")))
+cat(sprintf("Perplexity was calculated for models with 2 to 8 topics; the lowest perplexity was obtained at k = %d (%.1f). ",
+            best_k, min(tune$perplexity)),
+    sprintf("A %d-topic model was retained because, for a small corpus of %d articles, it balances statistical fit with topics that remain distinct and interpretable.\n\n",
+            n_topics, nrow(news_df)))
+cat("The word distribution per topic is summarised below:\n\n")
+for (i in seq_len(nrow(tt))) {
+  cat(sprintf("* **Topic %d** is characterised by *%s*. Its top %d words carry %.1f%% of the topic's probability mass, the topic accounts for %.1f%% of the corpus on average and it is the dominant topic in %d article(s).\n",
+              tt$topic[i], tt$w[i], k_words, 100 * tt$mass[i], 100 * tt$share[i], tt$docs[i]))
+}
+cat(sprintf("\nTopic %d is the most prevalent theme in the collection (%.1f%% average share), which indicates that it is the subject most frequently reported on in these articles.\n",
+            top_prev$topic, 100 * top_prev$share))
+```
+
+# Question 2.3 - Visualisations
+
+## Visualisation 1 - Top words per topic
+
+```{r vis1, fig.height=7}
+# Q2.3
+top_terms |>
+  mutate(term = reorder_within(term, beta, topic)) |>
+  ggplot(aes(beta, term, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free", labeller = label_both) +
+  scale_y_reordered() +
+  labs(title = "Top 10 Words per LDA Topic", x = "Beta (probability of word within topic)", y = "Term")
+```
+
+## Visualisation 2 - Word cloud per topic
+
+```{r vis2, fig.height=8}
+# Q2.3
+par(mfrow = c(2, ceiling(n_topics / 2)), mar = c(0, 0, 2, 0))
+for (t in seq_len(n_topics)) {
+  d <- beta |> filter(topic == t) |> slice_max(beta, n = 40, with_ties = FALSE)
+  wordcloud(d$term, d$beta, scale = c(3, 0.5), colors = brewer.pal(8, "Dark2"), random.order = FALSE)
+  title(paste("Topic", t))
+}
+```
+
+## Visualisation 3 - Word-topic heat map
+
+```{r vis3, fig.height=8}
+# Q2.3
+top_terms |>
+  ggplot(aes(factor(topic), reorder(term, beta), fill = beta)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(title = "Word-Topic Probability Heat Map", x = "Topic", y = "Term", fill = "Beta")
+```
+
+## Findings
+
+```{r findings23, echo=FALSE, results='asis'}
+lead  <- top_terms |> group_by(topic) |> slice_max(beta, n = 1, with_ties = FALSE) |> ungroup()
+shared <- top_terms |> count(term) |> filter(n > 1)
+cat("The bar charts and word clouds show the highest-probability word in each topic: ",
+    paste(sprintf("Topic %d - *%s* (beta = %.3f)", lead$topic, lead$term, lead$beta), collapse = "; "),
+    ". The larger the bar or the word in the cloud, the more strongly that word defines the topic.\n\n", sep = "")
+if (nrow(shared) > 0) {
+  cat(sprintf("The heat map shows that %d word(s) (*%s*) rank among the top words of more than one topic, which indicates some overlap between these themes, while the remaining words are specific to a single topic and make the topics clearly distinguishable.\n",
+              nrow(shared), paste(head(shared$term, 8), collapse = ", ")))
+} else {
+  cat("The heat map shows that no word ranks among the top words of more than one topic, which indicates that the topics are clearly separated from one another.\n")
+}
+```

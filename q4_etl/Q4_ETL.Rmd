@@ -1,0 +1,210 @@
+---
+title: "Question 4 - ETL with R and PostgreSQL"
+author: "R.P Molefe (EDUV4838900)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(rvest); library(robotstxt); library(tidyverse)
+dir.create("data", showWarnings = FALSE)
+```
+
+# Question 4.1 - Use case
+
+**What drives engagement on Hacker News front-page posts?**
+Hacker News (news.ycombinator.com) is a public technology news site. Its front page is naturally
+"messy" web data, which makes it a realistic ETL case:
+
+* job adverts have **no points** (missing values);
+* new posts show **"discuss"** instead of a comment count (inconsistent coding);
+* post age is **free text** such as "3 hours ago" (numeric value must be inferred with regex);
+* self-posts have **no domain** (incomplete);
+* text contains non-breaking spaces, emojis and other noise.
+
+Textual attributes: title, site. Numerical attributes: points, comments, age_hours (inferred).
+
+# Question 4.1 - Extract: web scraping with regex
+
+```{r scrape}
+# Q4.1
+stopifnot(paths_allowed("https://news.ycombinator.com/news"))
+
+scrape_hn <- function(p) {
+  pg <- read_html(paste0("https://news.ycombinator.com/news?p=", p))
+  Sys.sleep(3)
+  rows <- html_elements(pg, "tr.athing")
+  sub  <- html_elements(pg, "td.subtext")
+  tibble(
+    id           = html_attr(rows, "id"),
+    title        = rows |> html_element("span.titleline > a") |> html_text(),
+    site         = rows |> html_element("span.sitestr") |> html_text(),
+    points_raw   = sub  |> html_element("span.score") |> html_text(),
+    age_raw      = sub  |> html_element("span.age") |> html_text(),
+    comments_raw = map_chr(sub, ~ { a <- html_text(html_elements(.x, "a"))
+                                    if (length(a)) tail(a, 1) else NA_character_ })
+  )
+}
+
+if (file.exists("data/hn_posts_raw.csv")) {
+  raw_df <- read_csv("data/hn_posts_raw.csv", col_types = cols(.default = col_character()))
+} else {
+  raw_df <- map_dfr(1:2, scrape_hn)
+  write_csv(raw_df, "data/hn_posts_raw.csv")
+}
+cat("Records scraped:", nrow(raw_df), "\n")
+head(raw_df, 10)
+```
+
+**Spurious, inconsistent and incomplete values in the raw data:**
+
+```{r quality}
+# Q4.1
+colSums(is.na(raw_df))
+raw_df |> count(is_discuss = str_detect(comments_raw, "discuss"))
+head(unique(raw_df$age_raw), 8)
+```
+
+# Question 4.2 - Transform: cleaning, denoising and imputation
+
+| Problem | Fix |
+|---|---|
+| Duplicate posts across pages | `distinct(id)` |
+| Emojis / non-ASCII / extra spaces in titles | `iconv` + `str_squish` |
+| Missing domain (self-posts) | impute "news.ycombinator.com" |
+| Points missing (job ads) | flag post_type = "job", impute group median (0 if none), keep flag column |
+| "discuss" / "1&nbsp;comment" text | regex: "discuss" -> 0, extract the number |
+| Free-text age | regex number + unit -> hours |
+
+```{r clean}
+# Q4.2
+to_hours <- function(x) {
+  v <- as.numeric(str_extract(x, "\\d+"))
+  u <- str_extract(x, "minute|hour|day|month|year")
+  v * c(minute = 1/60, hour = 1, day = 24, month = 720, year = 8760)[u]
+}
+
+clean_df <- raw_df |>
+  distinct(id, .keep_all = TRUE) |>
+  mutate(
+    title          = title |> iconv(to = "ASCII//TRANSLIT", sub = "") |> str_squish(),
+    site           = coalesce(site, "news.ycombinator.com"),
+    post_type      = if_else(is.na(points_raw), "job", "story"),
+    points         = as.numeric(str_extract(points_raw, "\\d+")),
+    comments       = case_when(str_detect(comments_raw, "comment") ~ as.numeric(str_extract(comments_raw, "\\d+")),
+                               str_detect(comments_raw, "discuss") ~ 0,
+                               TRUE ~ NA_real_),
+    age_hours      = round(unname(to_hours(age_raw)), 2),
+    points_imputed = is.na(points)
+  ) |>
+  group_by(post_type) |>
+  mutate(points   = if_else(is.na(points),
+                            if (all(is.na(points))) 0 else median(points, na.rm = TRUE), points),
+         comments = replace_na(comments, 0)) |>
+  ungroup() |>
+  mutate(age_hours = if_else(is.na(age_hours), median(age_hours, na.rm = TRUE), age_hours),
+         points = round(points), comments = round(comments),
+         scraped_at = format(Sys.time(), "%Y-%m-%d %H:%M:%S")) |>
+  filter(!is.na(title), title != "") |>
+  select(id, title, site, post_type, points, comments, age_hours, points_imputed, scraped_at)
+
+colSums(is.na(clean_df))
+summary(clean_df |> select(points, comments, age_hours))
+head(clean_df, 10)
+
+write_csv(clean_df, "data/hn_posts_clean.csv")
+cat("Clean CSV saved to data/hn_posts_clean.csv with", nrow(clean_df), "rows\n")
+```
+
+## Findings
+
+```{r findings42, echo=FALSE, results='asis'}
+na_raw <- colSums(is.na(raw_df))
+n_disc <- sum(str_detect(raw_df$comments_raw, "discuss"), na.rm = TRUE)
+cat(sprintf("A total of %d records were scraped from the Hacker News front page. The raw data contained %d missing points values, %d missing source domains and %d posts with the text \"discuss\" instead of a comment count, and post age was only available as free text (for example \"%s\").\n\n",
+            nrow(raw_df), na_raw[["points_raw"]], na_raw[["site"]], n_disc, raw_df$age_raw[1]))
+cat(sprintf("After cleaning, %d unique records remained with no missing values in any column. Missing domains were imputed as the Hacker News domain, %d missing points values were imputed with the group median and flagged in the points_imputed column, \"discuss\" was recoded to 0 comments, and age was converted to a numeric number of hours using regular expressions. The clean dataset was exported to hn_posts_clean.csv.\n",
+            nrow(clean_df), sum(clean_df$points_imputed)))
+```
+
+# Question 4.3 - Load and analyse in PostgreSQL
+
+The clean CSV file was imported into the PostgreSQL table `hn_posts` (database `itbda_project`).
+The SQL script is in `sql/analysis.sql`.
+
+**Analysis 1 - Which sources attract the most engagement?**
+
+```sql
+SELECT site,
+       COUNT(*)                  AS posts,
+       ROUND(AVG(points), 1)     AS avg_points,
+       ROUND(AVG(comments), 1)   AS avg_comments
+FROM hn_posts
+WHERE post_type = 'story'
+GROUP BY site
+ORDER BY avg_points DESC
+LIMIT 10;
+```
+
+```{r a1, echo=FALSE}
+# Q4.3
+stories <- clean_df |> filter(post_type == "story")
+a1 <- stories |> group_by(site) |>
+  summarise(posts = n(), avg_points = round(mean(points), 1), avg_comments = round(mean(comments), 1), .groups = "drop") |>
+  arrange(desc(avg_points)) |> head(10)
+knitr::kable(a1, caption = "Analysis 1 - top 10 sources by average points")
+```
+
+```{r findings43a, echo=FALSE, results='asis'}
+multi <- stories |> count(site) |> filter(n > 1)
+top_disc <- a1 |> slice_max(avg_comments, n = 1, with_ties = FALSE)
+cat(sprintf("**Interpretation:** stories from *%s* received the highest average score (%.1f points, %.1f comments on average), compared with an overall story average of %.1f points. ",
+            a1$site[1], a1$avg_points[1], a1$avg_comments[1], mean(stories$points)),
+    sprintf("Among the top ten sources, *%s* generated the most discussion (%.1f comments on average). ", top_disc$site, top_disc$avg_comments),
+    sprintf("Only %d of the %d sources appear more than once on the front page, so engagement is driven mainly by the individual story rather than by the reputation of the source, and averages for single-post sources should be interpreted with caution.\n",
+            nrow(multi), n_distinct(stories$site)))
+```
+
+**Analysis 2 - How does post age relate to points velocity and discussion?**
+
+```sql
+SELECT CASE WHEN age_hours < 3  THEN '1) 0-3 hours'
+            WHEN age_hours < 12 THEN '2) 3-12 hours'
+            ELSE '3) 12+ hours' END                        AS age_band,
+       COUNT(*)                                             AS posts,
+       ROUND(AVG(points), 1)                                AS avg_points,
+       ROUND(AVG(points / NULLIF(age_hours, 0)), 2)         AS points_per_hour,
+       ROUND(CORR(points, comments)::numeric, 2)            AS points_comments_corr
+FROM hn_posts
+WHERE post_type = 'story'
+GROUP BY 1
+ORDER BY 1;
+```
+
+```{r a2, echo=FALSE}
+# Q4.3
+safe_cor <- function(x, y) if (length(x) > 2 && sd(x) > 0 && sd(y) > 0) round(cor(x, y), 2) else NA_real_
+a2 <- stories |>
+  mutate(age_band = case_when(age_hours < 3 ~ "1) 0-3 hours", age_hours < 12 ~ "2) 3-12 hours", TRUE ~ "3) 12+ hours")) |>
+  group_by(age_band) |>
+  summarise(posts = n(), avg_points = round(mean(points), 1),
+            points_per_hour = round(mean(points / if_else(age_hours == 0, NA_real_, age_hours), na.rm = TRUE), 2),
+            points_comments_corr = safe_cor(points, comments), .groups = "drop") |>
+  arrange(age_band)
+knitr::kable(a2, caption = "Analysis 2 - engagement by post age")
+```
+
+```{r findings43b, echo=FALSE, results='asis'}
+fast <- a2 |> slice_max(points_per_hour, n = 1, with_ties = FALSE)
+most <- a2 |> slice_max(avg_points, n = 1, with_ties = FALSE)
+r_all <- safe_cor(stories$points, stories$comments)
+strength <- if (is.na(r_all)) "an undetermined" else if (abs(r_all) >= 0.7) "a strong" else if (abs(r_all) >= 0.4) "a moderate" else "a weak"
+cat(sprintf("**Interpretation:** posts in the *%s* band gain points the fastest (%.2f points per hour), while posts in the *%s* band have the highest average total score (%.1f points). ",
+            sub("^\\d\\) ", "", fast$age_band), fast$points_per_hour, sub("^\\d\\) ", "", most$age_band), most$avg_points),
+    "This shows that new stories collect votes quickly when they first reach the front page, and their total score keeps growing as they remain visible for longer, although the rate of new votes slows down over time. ",
+    sprintf("Across all stories, the correlation between points and comments is %.2f, %s positive relationship, which means that highly voted stories also tend to attract more discussion.\n",
+            r_all, strength))
+```
